@@ -1,5 +1,5 @@
 from collections import deque
-from typing import Deque, Dict, List, Optional, Tuple
+from typing import Deque, Dict, List, Optional, Tuple, Union
 
 
 def iou(a: List[float], b: List[float]) -> float:
@@ -34,6 +34,10 @@ class SimpleTracker:
         semantic_prior: Optional[Dict[Tuple[int, int], float]] = None,
         semantic_threshold: float = -1.0,
         default_semantic_prob: float = 0.05,
+        # Hysteresis thresholds
+        hysteresis: bool = False,
+        thresh_low: Union[float, Dict[int, float], None] = None,
+        thresh_high: Union[float, Dict[int, float], None] = None,
     ):
         self.iou_thresh = float(iou_thresh)
         self.max_miss = int(max_miss)
@@ -44,6 +48,10 @@ class SimpleTracker:
         self.semantic_prior = semantic_prior or None
         self.semantic_threshold = float(semantic_threshold)
         self.default_semantic_prob = float(default_semantic_prob)
+        # Hysteresis config
+        self.hysteresis = bool(hysteresis)
+        self.thresh_low = thresh_low
+        self.thresh_high = thresh_high
 
     def _assign(self, dets: List[Tuple[List[float], float, int]]):
         assigned: Dict[int, Tuple[List[float], float, int]] = {}
@@ -81,15 +89,50 @@ class SimpleTracker:
                         # If transition probability below threshold, keep previous class
                         if prob < self.semantic_threshold:
                             final_cls = int(prev_cls)
-                    cls = int(final_cls)
-                    conf = avg_conf
+                    cand_cls = int(final_cls)
+                    cand_conf = avg_conf
                 else:
-                    t["cls"] = int(cls)
-                    t["conf"] = float(conf)
+                    cand_cls = int(cls)
+                    cand_conf = float(conf)
                 # Update track's current class/conf after semantic smoothing
-                t["cls"] = int(cls)
-                t["conf"] = float(conf)
-                assigned[tid] = (b, conf, cls)
+                # Apply hysteresis on class switching if enabled
+                if self.hysteresis:
+                    prev_cls2 = t.get("cls", None)
+                    # resolve low/high thresholds (per-class or scalar)
+                    def resolve_th(map_or_val, c, default_val: float) -> float:
+                        if isinstance(map_or_val, dict):
+                            return float(map_or_val.get(int(c), default_val))
+                        if isinstance(map_or_val, (int, float)):
+                            return float(map_or_val)
+                        return float(default_val)
+
+                    low = resolve_th(self.thresh_low, cand_cls, 0.25)
+                    high = resolve_th(self.thresh_high, cand_cls, max(low, 0.5))
+                    new_cls = cand_cls
+                    new_conf = cand_conf
+                    if prev_cls2 is None:
+                        # first assignment: require high to latch, else accept but keep conf
+                        if cand_conf < high:
+                            new_cls = cand_cls  # still set, but may fluctuate; downstream smoothing can stabilize
+                    else:
+                        if cand_cls != int(prev_cls2):
+                            # switching requires high
+                            if cand_conf < high:
+                                new_cls = int(prev_cls2)
+                                # keep previous conf unchanged
+                                new_conf = float(t.get("conf", cand_conf))
+                        else:
+                            # staying on same class: drop to previous if below low
+                            if cand_conf < low:
+                                new_cls = int(prev_cls2)
+                                new_conf = float(t.get("conf", cand_conf))
+                    t["cls"] = int(new_cls)
+                    t["conf"] = float(new_conf)
+                    assigned[tid] = (b, float(t["conf"]), int(t["cls"]))
+                else:
+                    t["cls"] = int(cand_cls)
+                    t["conf"] = float(cand_conf)
+                    assigned[tid] = (b, float(cand_conf), int(cand_cls))
                 used.add(best_j)
             else:
                 t["miss"] = t.get("miss", 0) + 1

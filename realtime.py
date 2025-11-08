@@ -40,6 +40,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--smooth-window", type=int, default=0, help="Temporal smoothing window for class/conf per track (0=off)")
     p.add_argument("--smooth-min-fps", type=float, default=0.0, help="Enable smoothing only when avg FPS >= this (0=always follow --smooth-window)")
     p.add_argument("--torch-compile", action="store_true", help="Use torch.compile for potential speed-up (PyTorch 2.x)")
+    # Hysteresis to stabilize class switching
+    p.add_argument("--hysteresis", action="store_true", help="Enable hysteresis on class switching per track (requires tracking)")
+    p.add_argument("--hyst-margin", type=float, default=0.15, help="If --threshold-map provided, set high threshold = low + margin (per class)")
+    p.add_argument("--hyst-low", type=float, default=0.30, help="Global low threshold if --threshold-map not provided")
+    p.add_argument("--hyst-high", type=float, default=0.60, help="Global high threshold if --threshold-map not provided")
     # Dynamic resolution adaptation
     p.add_argument("--target-fps", type=float, default=0.0, help="Auto-adapt imgsz towards this FPS (0=disabled)")
     p.add_argument("--min-imgsz", type=int, default=320, help="Lower bound for dynamic imgsz")
@@ -59,6 +64,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--semantic-threshold", type=float, default=0.15, help="Minimum transition probability required to accept class change when semantic smoothing active")
     p.add_argument("--semantic-map", type=str, default="", help="Optional JSON file with transition probabilities: {\"prev->next\": prob, ...}")
     p.add_argument("--markov-display", action="store_true", help="Overlay Markov-decoded class (using transition prior) next to raw track class")
+    # Per-class threshold override map
+    p.add_argument("--threshold-map", type=str, default="", help="Optional JSON file produced by scripts/per_class_thresholds.py to override per-class confidence thresholds")
+    # Console logging (per-interval summary)
+    p.add_argument("--console-log-interval", type=float, default=1.0, help="Interval seconds for console stats (set 0 to disable)")
+    p.add_argument("--console-log-verbose", action="store_true", help="Print extended per-interval metrics (class histogram, status)")
+    p.add_argument("--console-log-topk", type=int, default=3, help="Top-K classes to print in verbose console logs")
     # Default to threaded mode by default for stability on Windows webcams
     p.set_defaults(threaded=True)
     return p.parse_args()
@@ -288,6 +299,41 @@ def main() -> None:
     avg_fps = 0.0
     adapt_last = time.time()
     dynamic_imgsz = args.imgsz
+    # Track measurement window separate from warmup so short runs still report sensible FPS
+    measure_started = False
+    measure_t0 = t0
+    # Load per-class threshold map if provided
+    per_class_thresholds: Optional[Dict[int, float]] = None
+    if args.threshold_map:
+        try:
+            with open(args.threshold_map, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            # Accept either {name:th} or nested structure like produced by script
+            if "thresholds_by_id" in data:
+                # keys may be str(int)
+                pct: Dict[int, float] = {}
+                for k, v in data["thresholds_by_id"].items():
+                    try:
+                        pct[int(k)] = float(v)
+                    except Exception:
+                        pass
+                per_class_thresholds = pct if pct else None
+            elif isinstance(data, dict):
+                # name keyed
+                # need model names to map later; store temporarily as name->value using -1 sentinel id map performed after model load
+                per_class_thresholds = {}
+                # We'll remap names after model is created below
+                # Temporarily stash raw map in this variable and reprocess below
+                per_class_thresholds = None  # placeholder; will rebuild after model init
+                name_map_raw = {k: v for k, v in data.items() if isinstance(v, (int, float))}
+            else:
+                per_class_thresholds = None
+        except Exception as e:  # noqa: BLE001
+            print(f"[realtime] Failed to load threshold map: {e}")
+            per_class_thresholds = None
+    else:
+        name_map_raw = None  # type: ignore
+
     if args.threaded:
         # Lightweight IOU tracker for threaded mode
         from src.yolo12.utils.tracker import SimpleTracker
@@ -321,6 +367,17 @@ def main() -> None:
 
         # If conditional smoothing is requested, start with smoothing off; it will toggle on when FPS condition met.
         init_sw = 0 if (not args.no_track and args.smooth_min_fps > 0 and args.smooth_window > 0) else args.smooth_window
+        # Build hysteresis maps if requested
+        hyst_low_map = None
+        hyst_high_map = None
+        if args.hysteresis:
+            if per_class_thresholds:
+                hyst_low_map = {int(k): float(v) for k, v in per_class_thresholds.items()}
+                hyst_high_map = {k: max(float(v) + float(args.hyst_margin), float(v)) for k, v in hyst_low_map.items()}
+            else:
+                hyst_low_map = args.hyst_low
+                hyst_high_map = args.hyst_high
+
         tracker = (
             SimpleTracker(
                 iou_thresh=0.4,
@@ -328,6 +385,9 @@ def main() -> None:
                 smooth_window=init_sw,
                 semantic_prior=semantic_prior if args.semantic_smooth else None,
                 semantic_threshold=float(args.semantic_threshold) if args.semantic_smooth else -1.0,
+                hysteresis=bool(args.hysteresis),
+                thresh_low=hyst_low_map,
+                thresh_high=hyst_high_map,
             )
             if not args.no_track
             else None
@@ -335,6 +395,20 @@ def main() -> None:
         # Sequence aggregators per track id
         seq_aggs: Dict[int, SequenceAggregator] = {}
         seq_enabled = bool(args.seq_log) and (tracker is not None)
+
+        # Per-interval console logging accumulators
+        sec_t0 = time.time()
+        sec_frames = 0
+        sec_detected_frames = 0
+        sec_dets_total = 0
+        sec_conf_sum = 0.0
+        sec_conf_count = 0
+        sec_max_conf = 0.0
+        sec_max_conf_name = ""
+        sec_cls_count: Dict[int, int] = {}
+        last_any_detected = False
+        last_max_conf = 0.0
+        last_max_name = ""
 
         for frame in frames_stream():
             all_frames += 1
@@ -372,15 +446,67 @@ def main() -> None:
                     print(f"[realtime] Inference error: {e}")
                     break
             res = results[0]
+            # If per-class threshold map loaded, filter detections manually
+            if per_class_thresholds is None and 'name_map_raw' in locals() and name_map_raw:
+                # Build id map using res.names
+                try:
+                    id_map = {name: idx for idx, name in res.names.items()}  # type: ignore[attr-defined]
+                    pct: Dict[int, float] = {}
+                    for name, th in name_map_raw.items():
+                        if name in id_map:
+                            try:
+                                pct[int(id_map[name])] = float(th)
+                            except Exception:
+                                pass
+                    per_class_thresholds = pct if pct else None
+                except Exception:
+                    pass
             im = frame.copy()
             boxes = res.boxes
             if boxes is not None and len(boxes) > 0:
                 xyxy = boxes.xyxy.cpu().numpy()
                 confs = boxes.conf.cpu().numpy()
                 clss = boxes.cls.cpu().numpy()
-                dets = [(xyxy[i].tolist(), float(confs[i]), int(clss[i])) for i in range(len(xyxy))]
+                dets_raw = [(xyxy[i].tolist(), float(confs[i]), int(clss[i])) for i in range(len(xyxy))]
+                if per_class_thresholds:
+                    dets = []
+                    for b, c, k in dets_raw:
+                        th = per_class_thresholds.get(k, args.conf)
+                        if c >= th:
+                            dets.append((b, c, k))
+                else:
+                    dets = dets_raw
             else:
                 dets = []
+
+            # Per-interval stats update
+            sec_frames += 1
+            if dets:
+                sec_detected_frames += 1
+                sec_dets_total += len(dets)
+                # confidence aggregates
+                for _, c, k in dets:
+                    sec_conf_sum += float(c)
+                    sec_conf_count += 1
+                    if c > sec_max_conf:
+                        sec_max_conf = float(c)
+                        try:
+                            sec_max_conf_name = res.names.get(k, str(k))  # type: ignore[attr-defined]
+                        except Exception:
+                            sec_max_conf_name = str(k)
+                    sec_cls_count[int(k)] = sec_cls_count.get(int(k), 0) + 1
+                # remember last frame status
+                last_any_detected = True
+                top = max(dets, key=lambda x: x[1])
+                last_max_conf = float(top[1])
+                try:
+                    last_max_name = res.names.get(int(top[2]), str(int(top[2])))  # type: ignore[attr-defined]
+                except Exception:
+                    last_max_name = str(int(top[2]))
+            else:
+                last_any_detected = False
+                last_max_conf = 0.0
+                last_max_name = ""
 
             if tracker is not None and dets:
                 assigned = tracker.update(dets)
@@ -412,7 +538,10 @@ def main() -> None:
             else:
                 frame_count += 1
                 now = time.time()
-                elapsed = now - t0
+                if not measure_started:
+                    measure_started = True
+                    measure_t0 = now
+                elapsed = now - measure_t0
                 if elapsed > 0:
                     current_fps = frame_count / elapsed
                     avg_fps = avg_fps * 0.9 + current_fps * 0.1
@@ -480,6 +609,42 @@ def main() -> None:
                 break
             if args.duration > 0 and (time.time() - t0) >= args.duration:
                 break
+            # Console interval logging
+            if args.console_log_interval > 0 and (time.time() - sec_t0) >= args.console_log_interval:
+                sec_elapsed = max(1e-6, time.time() - sec_t0)
+                fps_inst = sec_frames / sec_elapsed if sec_frames > 0 else 0.0
+                avg_conf = (sec_conf_sum / sec_conf_count) if sec_conf_count > 0 else 0.0
+                det_rate = sec_detected_frames / sec_frames if sec_frames > 0 else 0.0
+                base_msg = (
+                    f"[log] fps={fps_inst:.1f} | {sec_frames}f | det={sec_detected_frames} ({det_rate*100:.1f}%) "
+                    f"| boxes={sec_dets_total} | conf(avg/max)={avg_conf:.3f}/{sec_max_conf:.3f} {sec_max_conf_name}"
+                )
+                if args.console_log_verbose and sec_cls_count:
+                    # Top-K classes by count
+                    try:
+                        sorted_cls = sorted(sec_cls_count.items(), key=lambda x: x[1], reverse=True)[: max(1, args.console_log_topk)]
+                        parts = []
+                        for cid, cnt in sorted_cls:
+                            try:
+                                cname = res.names.get(cid, str(cid))  # type: ignore[attr-defined]
+                            except Exception:
+                                cname = str(cid)
+                            parts.append(f"{cname}:{cnt}")
+                        cls_str = ", ".join(parts)
+                        base_msg += f" | top[{len(sorted_cls)}]={cls_str}"
+                    except Exception:
+                        pass
+                print(base_msg)
+                # reset accumulators
+                sec_t0 = time.time()
+                sec_frames = 0
+                sec_detected_frames = 0
+                sec_dets_total = 0
+                sec_conf_sum = 0.0
+                sec_conf_count = 0
+                sec_max_conf = 0.0
+                sec_max_conf_name = ""
+                sec_cls_count = {}
         # End of threaded loop: dump sequence JSON if requested
         if args.seq_log and tracker is not None:
             try:
@@ -515,13 +680,50 @@ def main() -> None:
             except Exception:
                 n_dets = 0
 
+            # Non-threaded interval logging accumulators init
+            if 'sec_t0' not in locals():
+                sec_t0 = time.time()
+                sec_frames = 0
+                sec_detected_frames = 0
+                sec_dets_total = 0
+                sec_conf_sum = 0.0
+                sec_conf_count = 0
+                sec_max_conf = 0.0
+                sec_max_conf_name = ""
+                sec_cls_count = {}
+            sec_frames += 1
+            if n_dets > 0 and res.boxes is not None:
+                boxes_obj = res.boxes
+                try:
+                    confs = boxes_obj.conf.cpu().numpy()
+                    clss = boxes_obj.cls.cpu().numpy()
+                except Exception:
+                    confs = []
+                    clss = []
+                sec_detected_frames += 1
+                sec_dets_total += int(n_dets)
+                for i in range(len(confs)):
+                    c = float(confs[i])
+                    sec_conf_sum += c
+                    sec_conf_count += 1
+                    if c > sec_max_conf:
+                        sec_max_conf = c
+                        try:
+                            sec_max_conf_name = res.names.get(int(clss[i]), str(int(clss[i])))  # type: ignore[attr-defined]
+                        except Exception:
+                            sec_max_conf_name = str(int(clss[i]))
+                    sec_cls_count[int(clss[i])] = sec_cls_count.get(int(clss[i]), 0) + 1
+
             # Compute instantaneous and rolling FPS
             if all_frames <= args.warmup_frames:
                 current_fps = 0.0
             else:
                 frame_count += 1
                 now = time.time()
-                elapsed = now - t0
+                if not measure_started:
+                    measure_started = True
+                    measure_t0 = now
+                elapsed = now - measure_t0
                 if elapsed > 0:
                     current_fps = frame_count / elapsed
                     avg_fps = avg_fps * 0.9 + current_fps * 0.1
@@ -562,11 +764,55 @@ def main() -> None:
                 break
             if args.duration > 0 and (time.time() - t0) >= args.duration:
                 break
+            if args.console_log_interval > 0 and (time.time() - sec_t0) >= args.console_log_interval:
+                det_rate = sec_detected_frames / sec_frames if sec_frames > 0 else 0.0
+                avg_conf = (sec_conf_sum / sec_conf_count) if sec_conf_count > 0 else 0.0
+                sec_elapsed = max(1e-6, time.time() - sec_t0)
+                fps_inst = sec_frames / sec_elapsed if sec_frames > 0 else 0.0
+                msg = (
+                    f"[log] fps={fps_inst:.1f} | {sec_frames}f | det={sec_detected_frames} ({det_rate*100:.1f}%) | boxes={sec_dets_total} "
+                    f"| conf(avg/max)={avg_conf:.3f}/{sec_max_conf:.3f} {sec_max_conf_name}"
+                )
+                if args.console_log_verbose and sec_cls_count:
+                    try:
+                        sorted_cls = sorted(sec_cls_count.items(), key=lambda x: x[1], reverse=True)[: max(1, args.console_log_topk)]
+                        parts = []
+                        for cid, cnt in sorted_cls:
+                            try:
+                                cname = res.names.get(cid, str(cid))  # type: ignore[attr-defined]
+                            except Exception:
+                                cname = str(cid)
+                            parts.append(f"{cname}:{cnt}")
+                        msg += f" | top[{len(sorted_cls)}]={', '.join(parts)}"
+                    except Exception:
+                        pass
+                print(msg)
+                sec_t0 = time.time()
+                sec_frames = 0
+                sec_detected_frames = 0
+                sec_dets_total = 0
+                sec_conf_sum = 0.0
+                sec_conf_count = 0
+                sec_max_conf = 0.0
+                sec_max_conf_name = ""
+                sec_cls_count = {}
 
     cv2.destroyAllWindows()
     total_time = time.time() - t0
-    final_fps = frame_count / total_time if total_time > 0 else 0.0
-    print(f"[realtime] Finished. Total frames: {all_frames} (warmup {min(args.warmup_frames, all_frames)}), measured frames: {frame_count}, elapsed: {total_time:.2f}s, avg FPS: {final_fps:.1f}")
+    if frame_count > 0 and measure_started:
+        measured_time = max(1e-6, time.time() - measure_t0)
+        final_fps = frame_count / measured_time
+        print(
+            f"[realtime] Finished. Total frames: {all_frames} (warmup {min(args.warmup_frames, all_frames)}), "
+            f"measured frames: {frame_count}, measured time: {measured_time:.2f}s, avg FPS: {final_fps:.1f}"
+        )
+    else:
+        # Fallback: short run entirely within warmup; still provide useful FPS
+        final_fps = all_frames / total_time if total_time > 0 else 0.0
+        print(
+            f"[realtime] Finished (all frames fell into warmup). Total frames: {all_frames}, elapsed: {total_time:.2f}s, "
+            f"approx FPS: {final_fps:.1f}. Tip: use --warmup-frames 0 or increase --duration for measured stats."
+        )
     if log_fp is not None:
         try:
             log_fp.flush()

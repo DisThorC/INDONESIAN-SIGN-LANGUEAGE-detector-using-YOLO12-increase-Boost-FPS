@@ -59,6 +59,10 @@ PY
 --threaded            Enable threaded capture (default)
 --max-det N           Limit detections per frame
 --torch-compile       Use torch.compile if available
+--threshold-map PATH  Apply per-class confidence overrides (JSON from scripts/per_class_thresholds.py)
+--console-log-interval S  Print per-S seconds summary (frames, detection rate, avg/max conf)
+--console-log-verbose     Include top-K class histogram and extended stats
+--console-log-topk K      Number of top classes to show when verbose
 ```
 
 Example high‑speed run (stride + reduced imgsz + no tracking):
@@ -69,6 +73,30 @@ python .\realtime.py --duration 15 --threaded --vid-stride 2 --imgsz 512 --no-tr
 Semantic smoothing + Markov:
 ```powershell
 python .\realtime.py --duration 15 --threaded --vid-stride 2 --smooth-window 5 --semantic-smooth --semantic-threshold 0.15 --semantic-map configs\semantic_prior.json
+```
+
+Per-class thresholds (first lower global --conf to allow overrides, e.g. 0.10):
+```powershell
+python .\scripts\per_class_thresholds.py --weights runs\train\exp_y12s_50e_640\weights\best.pt --data configs\data.yaml --device cuda
+python .\realtime.py --conf 0.10 --threshold-map runs\analysis\per_class_thresholds.json --duration 15 --threaded
+```
+
+Realtime with per-second console stats:
+```powershell
+python .\realtime.py --duration 10 --console-log-interval 1 --device cuda
+```
+
+Default logging interval is 1s; disable by setting `--console-log-interval 0`.
+
+Verbose stats (top classes):
+```powershell
+python .\realtime.py --duration 15 --console-log-interval 1 --console-log-verbose --console-log-topk 5 --device cuda
+```
+
+Generate precision-oriented thresholds and dump PR curves:
+```powershell
+python .\scripts\per_class_thresholds.py --weights runs\train\exp_y12s_50e_640\weights\best.pt --data configs\data.yaml --device cuda --optimize precision --target-precision 0.97 --dump-pr-curves --out runs\analysis\per_class_thresholds_prec.json
+# The JSON contains curves_by_id: for each class id -> arrays of thresholds, precision, recall, f1
 ```
 
 ---
