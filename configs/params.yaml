@@ -1,0 +1,33 @@
+# Training hyperparameters and paths for Ultralytics YOLO
+model: ./weights/yolo12.pt
+epochs: 50
+imgsz: 640
+batch: 16
+patience: 50
+workers: 0  # Windows dataloader stability
+device: cuda  # switched from cpu to cuda for GPU training
+project: runs/train
+name: exp
+seed: 42
+save: true
+exist_ok: true
+bbox_interval: -1
+val: true
+resume: false
+optimizer: auto
+## Augmentation & regularization (Ultralytics keys). Adjust and run ablations.
+# hsv_h: 0.015
+# hsv_s: 0.7
+# hsv_v: 0.4
+# degrees: 0.0
+# translate: 0.1
+# scale: 0.5
+# shear: 0.0
+# perspective: 0.0
+# flipud: 0.0
+# fliplr: 0.5
+# mosaic: 1.0   # 1.0=enabled, 0.0=disabled
+# mixup: 0.1
+# copy_paste: 0.0
+# erasing: 0.0
+# Note: Uncomment and tune above for augmentation experiments.

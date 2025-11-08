@@ -1,0 +1,17 @@
+# Ultralytics data config for the provided Roboflow dataset
+# Points directly to the attached folder with train/valid/test splits
+path: "./Startup Campus 4 Indonesian Sign Language Detection.v5i.yolov12"
+train: train/images
+val: valid/images
+test: test/images
+names:
+  - Ayah
+  - Halo
+  - Kakak
+  - Minum
+  - Rumah
+  - Sama-sama
+  - Sehat
+  - Teman
+  - Terima kasih
+  - Tidur

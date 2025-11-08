@@ -1,0 +1,36 @@
+[project]
+name = "yolo12"
+version = "0.1.0"
+description = "Indonesian Sign Language detection with Ultralytics YOLO"
+authors = [{ name = "Your Name" }]
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+	"ultralytics>=8.2",
+	"opencv-python",
+	"numpy",
+	"pandas",
+	"matplotlib",
+	"seaborn",
+	"pyyaml",
+	"tqdm",
+	"onnxruntime",
+	"torchmetrics"
+]
+
+[tool.setuptools]
+packages = ["src"]
+
+[tool.setuptools.package-data]
+"src.yolo12" = ["**/*.yaml"]
+
+[tool.black]
+line-length = 100
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "I"]

@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.venv/
+.env
+.env.*
+
+# VS Code
+.vscode/
+!.vscode/settings.json
+!.vscode/launch.json
+!.vscode/tasks.json
+
+# Data & runs
+# ignore runs by default but allow the final weights folder below
+runs/
+!runs/
+!runs/train/
+!runs/train/exp_y12s_50e_640/
+!runs/train/exp_y12s_50e_640/weights/
+!runs/train/exp_y12s_50e_640/weights/best.pt
+!runs/train/exp_y12s_50e_640/weights/last.pt
+outputs/
+checkpoints/
+
+# Datasets and artifacts
+/data/**
+!/data/.gitkeep
+!/data/datasets/
+!/data/datasets/isl_yolo/
+!/data/datasets/isl_yolo/images/
+!/data/datasets/isl_yolo/labels/
+
+# External dataset folder - skip committing large assets
+Startup Campus 4 Indonesian Sign Language Detection.v5i.yolov12/
+
+# Common caches
+.pytest_cache/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
